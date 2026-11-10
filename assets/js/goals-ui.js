@@ -218,11 +218,30 @@
     const f = e.target.closest('[data-goal-import]');
     if (!f || !f.files[0]) return;
     f.files[0].text().then((txt) => {
-      const r = Goals.importPlan(txt);
-      U.toast(`Imported ${r.goals} goal${r.goals === 1 ? '' : 's'}: ${r.created} new tasks${r.updated ? `, ${r.updated} updated` : ''}`, 'success', 5000);
+      U.toast(importAny(txt), 'success', 6000);
       WL.App.render();
-    }).catch((err) => U.toast('Import failed: ' + err.message, 'error', 6000));
+    }).catch((err) => U.toast('Import failed: ' + err.message, 'error', 7000));
     f.value = '';
+  }
+
+  /**
+   * Import any OpsLog file from any import button: goal plans go to Goals, task libraries to the
+   * Task Library. A full backup is refused with a pointer to Settings (it replaces data, so it
+   * should only ever be imported on purpose). Returns the success message.
+   */
+  function importAny(text) {
+    let p;
+    try { p = JSON.parse(String(text).replace(/^\uFEFF/, '')); } catch { throw new Error("this isn't an OpsLog file (it isn't valid JSON)"); }
+    if (p && Array.isArray(p.goals) && Array.isArray(p.tasks)) {
+      const r = Goals.importPlan(p);
+      return `Imported goal plan: ${r.goals} goal${r.goals === 1 ? '' : 's'}, ${r.created} new tasks${r.updated ? `, ${r.updated} updated` : ''}`;
+    }
+    if (p && (p.format === 'opslog-library' || Array.isArray(p.areas))) {
+      const r = WL.Library.importLibrary(p);
+      return `That was a task library file, so it went into the Task Library: ${r.areas} area${r.areas === 1 ? '' : 's'}, ${r.templates} templates, ${r.packages} package${r.packages === 1 ? '' : 's'}`;
+    }
+    if (p && Array.isArray(p.entries)) throw new Error('this is an OpsLog backup — import it under Settings → Import backup');
+    throw new Error('this file is not an OpsLog goal plan or task library');
   }
 
   /* ---------------- dialogs ---------------- */
@@ -333,5 +352,5 @@
   }
   document.addEventListener('DOMContentLoaded', init);
 
-  WL.GoalsUI = { view, after, dashGoals, dashCalendar, openTask, openGoal };
+  WL.GoalsUI = { view, after, dashGoals, dashCalendar, openTask, openGoal, importAny };
 })(window.WL);

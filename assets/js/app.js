@@ -626,10 +626,18 @@
       $('#impJson').addEventListener('change', async (e) => {
         const file = e.target.files[0]; if (!file) return;
         try {
-          const replace = confirm('Replace all current data with this backup?\n\nOK = replace, Cancel = merge (keep existing and add new items).');
-          const n = Store.importJSON(await file.text(), replace ? 'replace' : 'merge');
-          U.toast(`Imported ${n} items`, 'success');
-        } catch (err) { U.toast('Import failed: ' + err.message, 'error'); }
+          const text = await file.text();
+          let parsed = null;
+          try { parsed = JSON.parse(text.replace(/^\uFEFF/, '')); } catch { /* reported below */ }
+          if (parsed && !Array.isArray(parsed.entries) && (Array.isArray(parsed.goals) || Array.isArray(parsed.areas))) {
+            U.toast(WL.GoalsUI.importAny(text), 'success', 6000); // a goal plan or task library picked here by mistake
+          } else {
+            const replace = confirm('Replace all current data with this backup?\n\nOK = replace, Cancel = merge (keep existing and add new items).');
+            const n = Store.importJSON(text.replace(/^\uFEFF/, ''), replace ? 'replace' : 'merge');
+            U.toast(`Imported ${n} items`, 'success');
+          }
+        } catch (err) { U.toast('Import failed: ' + err.message, 'error', 7000); }
+        e.target.value = '';
       });
       $('#demoLoad').addEventListener('click', () => { const n = WL.Demo.load(); U.toast(`Loaded ${n} sample items`, 'success'); });
       $('#demoRemove').addEventListener('click', () => { WL.Demo.remove(); U.toast('Sample data removed', 'success'); });

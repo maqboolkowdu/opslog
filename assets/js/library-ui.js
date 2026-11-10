@@ -191,10 +191,10 @@
       const f = e.target.files[0];
       if (!f) return;
       f.text().then((txt) => {
-        const r = Library.importLibrary(txt);
-        U.toast(`Imported ${r.areas} area${r.areas === 1 ? '' : 's'}, ${r.templates} templates and ${r.packages} package${r.packages === 1 ? '' : 's'}`, 'success', 5000);
+        U.toast(WL.GoalsUI.importAny(txt).replace('That was a task library file, so it went into the Task Library: ', 'Imported '), 'success', 6000);
         WL.App.render();
-      }).catch((err) => U.toast('Import failed: ' + err.message, 'error', 6000));
+      }).catch((err) => U.toast('Import failed: ' + err.message, 'error', 7000));
+      e.target.value = '';
     });
     wireSelBar();
   }
