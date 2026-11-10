@@ -1,0 +1,831 @@
+/* OpsLog — views, routing and UI wiring. */
+(function (WL) {
+  'use strict';
+  const { U, Store, Categories, Parser, Reports, Charts, Agent, Voice, Library } = WL;
+  const $ = U.$, $$ = U.$$;
+
+  const ROUTES = [
+    { id: 'dashboard', label: 'Home', short: 'Home', icon: 'dashboard' },
+    { id: 'routine', label: "Today's Routine", short: 'Today', icon: 'check', badge: true },
+    { id: 'goals', label: 'Goals', icon: 'flag' },
+    { id: 'log', label: 'Work Log', short: 'Log', icon: 'log' },
+    { id: 'tasks', label: 'Tasks & Jobs', short: 'Tasks', icon: 'tasks' },
+    { id: 'library', label: 'Task Library', short: 'Library', icon: 'library' },
+    { id: 'reports', label: 'Reports', icon: 'reports' },
+    { id: 'settings', label: 'Settings', icon: 'settings', foot: true },
+  ];
+  const STATUS = { open: 'Open', 'in-progress': 'In progress', blocked: 'Blocked', done: 'Done', skipped: 'Skipped' };
+  const PR_ORDER = { critical: 0, high: 1, normal: 2, low: 3 };
+  const ui = { route: 'dashboard', report: { kind: 'week', anchor: new Date() }, log: { q: '', cat: '', type: '', status: '', period: 'month' }, focusLoc: '', routineStatus: 'open', tasksFilter: 'all' };
+
+  /* ---------------- helpers ---------------- */
+  const chip = (id) => { const c = Categories.get(id); return `<span class="chip" style="--cat:${c.color}">${U.esc(c.name)}</span>`; };
+  const prBadge = (p) => (p === 'critical' || p === 'high' ? `<span class="badge badge-${p}">${p}</span>` : '');
+  const stBadge = (s) => `<span class="badge st-${s}">${STATUS[s] || s}</span>`;
+  const card = (title, body, { cls = '', actions = '' } = {}) => `<article class="card ${cls}"><header class="card-head"><h3>${title}</h3>${actions}</header><div class="card-body">${body}</div></article>`;
+  const empty = (msg, cta = '') => `<div class="empty"><div class="empty-ico">${U.icon('spark')}</div><p>${msg}</p>${cta}</div>`;
+  const locBadge = (l) => (l ? `<span class="badge loc">${U.esc(l)}</span>` : '');
+  const greetWord = () => { const h = new Date().getHours(); return h < 12 ? 'Good morning' : h < 17 ? 'Good afternoon' : 'Good evening'; };
+
+  function entryRow(e, { showDate = false } = {}) {
+    const t = Reports.entryTime(e);
+    return `<div class="row-item" data-id="${e.id}">
+      <div class="ri-time mono">${showDate ? `${t.getDate()} ${U.MONTHS_SHORT[t.getMonth()]}<br>` : ''}${U.fmtTime(t)}</div>
+      <div class="ri-dot" style="--cat:${Categories.get(e.category).color}"></div>
+      <div class="ri-main">
+        <div class="ri-title">${U.safe(e.title)}</div>
+        <div class="ri-meta">${chip(e.category)}${e.type !== 'entry' ? `<span class="badge">${e.type}</span>` : ''}${e.status !== 'done' ? stBadge(e.status) : ''}${prBadge(e.priority)}
+          ${e.minutes ? `<span class="meta">${U.icon('clock')}${U.fmtDuration(e.minutes)}</span>` : ''}${e.ticket ? `<span class="meta mono">${U.safe(e.ticket)}</span>` : ''}${locBadge(e.location)}
+          ${e.source === 'call' || e.source === 'voice' ? `<span class="meta" title="Captured by voice">${U.icon('mic')}</span>` : ''}</div>
+      </div>
+      <div class="ri-actions"><button class="icon-btn sm" data-edit="${e.id}" title="Edit">${U.icon('edit')}</button></div>
+    </div>`;
+  }
+
+  function taskCard(e) {
+    const overdue = e.due && e.due < U.ymd(new Date()) && e.status !== 'done';
+    return `<div class="task-card" draggable="true" data-id="${e.id}" style="--cat:${Categories.get(e.category).color}">
+      <div class="tc-top">${chip(e.category)}${prBadge(e.priority)}${e.type === 'job' ? '<span class="badge">job</span>' : ''}${e.ticket ? `<span class="badge mono">${U.safe(e.ticket)}</span>` : ''}${locBadge(e.location)}</div>
+      <div class="tc-title" data-edit="${e.id}">${U.safe(e.title)}</div>
+      <div class="tc-foot">${e.due ? `<span class="meta ${overdue ? 'overdue' : ''}">${U.icon('clock')}${U.relDay(U.parseYmd(e.due))}</span>` : '<span></span>'}
+        ${e.status !== 'done' ? `<button class="icon-btn sm ok" data-done="${e.id}" title="Mark done">${U.icon('check')}</button>` : ''}</div>
+    </div>`;
+  }
+
+  function streak() {
+    const days = new Set(Store.entries.map((e) => U.ymd(new Date(e.when))));
+    let n = 0;
+    let d = U.startOfDay(new Date());
+    if (!days.has(U.ymd(d))) d = U.addDays(d, -1);
+    for (let i = 0; i < 800; i++, d = U.addDays(d, -1)) {
+      if (!Agent.slotsFor(d).length) continue; // skip non-working days
+      if (days.has(U.ymd(d))) n++; else break;
+    }
+    return n;
+  }
+
+  function nextCallText() {
+    if (!Store.settings.agentEnabled) return { big: 'Paused', small: 'Check-in calls are off' };
+    const n = Agent.nextSlot();
+    if (!n) return { big: '—', small: 'No schedule configured' };
+    const mins = Math.round((n - new Date()) / 60000);
+    const when = U.sameDay(n, new Date()) ? U.fmtTime(n) : `${U.relDay(n) === 'Tomorrow' ? 'Tomorrow' : U.DAYS_SHORT[n.getDay()]} ${U.fmtTime(n)}`;
+    const rel = mins < 60 ? `in ${mins} min` : mins < 60 * 24 ? `in ${Math.floor(mins / 60)}h ${mins % 60}m` : `in ${Math.round(mins / 1440)} day(s)`;
+    return { big: when, small: rel };
+  }
+
+  /* ---------------- shell ---------------- */
+  function renderShell() {
+    const nav = (short, pick = () => true) => ROUTES.filter(pick).map((r) => `<a href="#/${r.id}" data-route="${r.id}">${U.icon(r.icon)}<span>${short && r.short ? r.short : r.label}</span>${r.badge ? '<b class="nav-badge" hidden></b>' : ''}</a>`).join('');
+    $('#nav').innerHTML = nav(false, (r) => !r.foot);
+    $('#navFoot').innerHTML = nav(false, (r) => r.foot);
+    $('#bottomNav').innerHTML = nav(true);
+    $('#btnAskAva').innerHTML = `${U.icon('chat')}<span>Ask ${U.esc(Store.settings.agentName || 'Ava')}</span>`;
+    renderProfile();
+    $('#btnNew').innerHTML = `${U.icon('plus')}<span class="hide-xs">New entry</span>`;
+    $('#btnQuickVoice').innerHTML = U.icon('mic');
+    $('#fabCall').innerHTML = U.icon('phone');
+    $('#btnAnswer').innerHTML = U.icon('phone');
+    $('#btnDecline').innerHTML = U.icon('phoneOff');
+    $('#btnSnooze').innerHTML = U.icon('snooze');
+    $('#btnEnd').innerHTML = U.icon('phoneOff');
+    $('#btnKeyboard').innerHTML = U.icon('keyboard');
+    $('#callSend').innerHTML = U.icon('send');
+    $('#fMic').innerHTML = U.icon('mic');
+    $$('[data-close]').forEach((b) => { if (!b.textContent.trim()) b.innerHTML = U.icon('x'); });
+    paintToggles();
+  }
+
+  function paintToggles() {
+    const dark = document.documentElement.dataset.theme ? document.documentElement.dataset.theme === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+    $('#btnTheme').innerHTML = U.icon(dark ? 'sun' : 'moon');
+    $('#btnShowcase').innerHTML = U.icon(Store.settings.showcase ? 'eyeOff' : 'eye');
+    $('#btnShowcase').classList.toggle('active', !!Store.settings.showcase);
+  }
+
+  function updateBadges() {
+    const left = Library.todays().filter((e) => e.status !== 'done').length;
+    $$('.nav-badge').forEach((b) => { b.textContent = left; b.hidden = !left; b.title = `${left} routine check${left === 1 ? '' : 's'} open today`; });
+  }
+
+  function renderProfile() {
+    const s = Store.settings;
+    const name = s.name || 'Set your name';
+    const initials = (s.name || 'O L').split(/\s+/).map((w) => w[0]).slice(0, 2).join('').toUpperCase();
+    $('#profile').innerHTML = `<span class="avatar-ini">${U.esc(initials)}</span><span class="pf-txt"><b>${U.esc(name)}</b><small>${U.esc(s.org || s.role || '')}</small></span>`;
+  }
+
+  function renderSideNext() {
+    updateBadges();
+    renderProfile();
+    const n = nextCallText();
+    const focus = WL.Focus && WL.Focus.isActive();
+    $('#nextCallLink').innerHTML = `${U.icon(focus ? 'chat' : 'phone')}<span>${focus ? 'Calls on hold · focusing' : `Next call ${n.big}`}</span>`;
+    $('#nextCallLink').title = focus ? 'A focus session is running — Ava messages you quietly instead of calling' : `Next check-in ${n.small}. Click to call ${Store.settings.agentName || 'Ava'} now.`;
+  }
+
+  function setActiveNav() {
+    $$('[data-route]').forEach((a) => a.classList.toggle('active', a.dataset.route === ui.route));
+  }
+
+  function route() {
+    const id = (location.hash.replace(/^#\/?/, '').split('?')[0]) || 'dashboard';
+    ui.route = ROUTES.some((r) => r.id === id) ? id : 'dashboard';
+    setActiveNav();
+    render();
+    $('#view').focus({ preventScroll: true });
+    window.scrollTo({ top: 0 });
+  }
+
+  function render() {
+    const r = ROUTES.find((x) => x.id === ui.route);
+    $('#pageTitle').textContent = ui.route === 'dashboard' ? `Hello${Store.settings.name ? ' ' + Store.settings.name.split(' ')[0] : ''}` : r.label;
+    const v = $('#view');
+    const views = { dashboard: viewDashboard, routine: viewRoutine, goals: () => WL.GoalsUI.view(), log: viewLog, tasks: viewTasks, library: () => WL.LibraryUI.view(), reports: viewReports, settings: viewSettings };
+    v.innerHTML = views[ui.route]();
+    v.className = `view view-${ui.route}`;
+    if (ui.route === 'library') WL.LibraryUI.after(); else if (ui.route === 'goals') WL.GoalsUI.after(); else afterRender[ui.route] && afterRender[ui.route]();
+    renderSideNext();
+  }
+
+  /* ---------------- Dashboard ---------------- */
+  function viewDashboard() {
+    $('#pageSub').textContent = U.fmtDate(new Date());
+    const day = Reports.aggregate(Reports.range('day'));
+    const week = Reports.aggregate(Reports.range('week'));
+    const month = Reports.aggregate(Reports.range('month'));
+    const open = Store.openTasks().filter((e) => !e.templateId && !e.goalId).sort((a, b) => (a.due || '9999').localeCompare(b.due || '9999'));
+    const n = nextCallText();
+    const weekBars = week.buckets.map((b) => ({ label: b.label, value: b.value }));
+    const todayIdx = week.buckets.findIndex((b) => U.sameDay(b.start, new Date()));
+    const donutData = month.cats.map((c) => ({ label: c.cat.name, value: c.n, color: c.cat.color }));
+    const agent = U.esc(Store.settings.agentName || 'Ava');
+    let hideBanner = false;
+    try { hideBanner = localStorage.getItem('opslog:banner:hidden') === U.ymd(new Date()); } catch { /* per-viewer convenience only */ }
+    const focusing = WL.Focus && WL.Focus.isActive();
+
+    // "Your day" usage rows
+    const routine = Library.todays();
+    const rDone = routine.filter((e) => e.status === 'done').length;
+    const ws = Reports.range('week');
+    const gWeek = WL.Goals ? WL.Goals.tasks().filter((t) => WL.Goals.mine(t) && (t.due || t.start) >= U.ymd(ws.start) && (t.due || t.start) < U.ymd(ws.end) && !t.optional) : [];
+    const gDone = gWeek.filter((t) => t.status === 'done').length;
+    const focusMin = WL.Focus ? WL.Focus.todayMinutes() : 0;
+    const usage = (label, val, sub, pct) => `<div class="use-row"><div class="use-top"><span>${label}</span><span class="use-val">${val}</span></div>
+      ${pct != null ? `<div class="progress thin"><span style="width:${Math.min(100, Math.round(pct * 100))}%"></span></div>` : ''}<p class="muted small">${sub}</p></div>`;
+
+    return `
+      ${hideBanner ? '' : `<section class="card banner-card">
+        <div class="bc-text">
+          <h3>${focusing ? 'Focus session running — calls are on hold' : `Next check-in with ${agent}: ${n.big}`}</h3>
+          <p>${focusing ? `${agent} will message you quietly instead of calling. Open the focus dial in the corner to see time left.`
+            : `${n.small === 'Check-in calls are off' ? 'Check-in calls are paused in Settings.' : `${agent} calls ${n.small}. Need to concentrate? Start a focus session and she'll message you quietly instead.`}`}</p>
+          <div class="btn-row">
+            <button class="btn btn-primary" data-call>${U.icon('phone')} Call ${agent} now</button>
+            <button class="btn btn-ghost" id="dashFocus">${U.icon('dial')} ${focusing ? 'Open focus dial' : 'Start a focus session'}</button>
+          </div>
+        </div>
+        <div class="bc-art" aria-hidden="true">
+          <svg viewBox="0 0 320 150" class="bc-svg">
+            <rect x="24" y="16" width="272" height="122" rx="10" fill="var(--surface)" stroke="var(--border)"/>
+            <rect x="40" y="34" width="70" height="7" rx="3.5" fill="var(--text)" opacity=".7"/>
+            <rect x="40" y="50" width="96" height="6" rx="3" fill="var(--track)"/><rect x="40" y="62" width="80" height="6" rx="3" fill="var(--track)"/>
+            <rect x="40" y="84" width="96" height="5" rx="2.5" fill="var(--accent)" opacity=".5"/><rect x="40" y="96" width="70" height="5" rx="2.5" fill="var(--accent)" opacity=".35"/>
+            <rect x="160" y="30" width="118" height="92" rx="8" fill="var(--bg-2)"/>
+            <circle cx="219" cy="56" r="13" fill="var(--brand)"/><path d="M213 56l4 4 8-8" stroke="#fff" stroke-width="3" fill="none" stroke-linecap="round"/>
+            <rect x="186" y="80" width="66" height="6" rx="3" fill="var(--text)" opacity=".6"/>
+            <rect x="176" y="94" width="86" height="12" rx="6" fill="none" stroke="var(--accent)"/><rect x="196" y="98" width="46" height="4" rx="2" fill="var(--accent)"/>
+          </svg>
+        </div>
+        <button class="icon-btn sm bc-x" id="bannerHide" aria-label="Hide for today">${U.icon('x')}</button>
+      </section>`}
+
+      <div class="cal-goals">
+        ${WL.GoalsUI.dashCalendar()}
+        ${WL.GoalsUI.dashGoals()}
+      </div>
+
+      <div class="grid-2 dash-pair">
+        ${card('Quick log', `
+          <p class="muted small">${day.items.length ? `${day.items.length} item${day.items.length > 1 ? 's' : ''} logged today${day.minutes ? ` · ${U.fmtDuration(day.minutes)} recorded` : ''}.` : 'Nothing logged yet today. Type or dictate what you worked on.'}</p>
+          <form class="quick" id="quickForm" autocomplete="off">
+            <div class="quick-input">
+              <input id="quickText" placeholder="e.g. Traced mail flow for finance, NDR from partner — 20 min" aria-label="Quick log" />
+              <button type="button" class="icon-btn mic-btn" id="quickMic" title="Dictate">${U.icon('mic')}</button>
+            </div>
+            <button class="btn btn-primary" type="submit">Log it</button>
+          </form>
+          <div class="quick-preview" id="quickPreview"></div>`)}
+        ${card('Your day', `
+          ${usage("Today's routine checks", routine.length ? `${rDone} / ${routine.length}` : '—', routine.length ? `${routine.length - rDone} still open` : 'No routine checks due today', routine.length ? rDone / routine.length : null)}
+          ${usage('Goal tasks this week', gWeek.length ? `${gDone} / ${gWeek.length}` : '—', gWeek.length ? `${gWeek.length - gDone} left for you this week` : 'Nothing scheduled for you this week', gWeek.length ? gDone / gWeek.length : null)}
+          ${usage('Focus time today', U.fmtDuration(focusMin), 'Work and study sessions from the focus dial', focusMin / 240)}
+          ${usage('Check-ins answered this week', `${week.calls.answered} / ${week.calls.total}`, 'Calls held during focus sessions are not counted', week.calls.total ? week.calls.answered / week.calls.total : 0)}`, { cls: 'usage-card' })}
+      </div>
+
+      <div class="grid-2">
+        ${card(`Today's timeline`, day.items.length ? `<div class="timeline">${day.items.slice().reverse().map((e) => entryRow(e)).join('')}</div>` : empty('No entries yet today.', `<button class="btn btn-ghost" data-call>${U.icon('phone')} Log by voice</button>`), { actions: `<a class="link-btn" href="#/log">View log →</a>` })}
+        ${card('Open tasks & jobs', open.length ? `<div class="task-list">${open.slice(0, 7).map(taskCard).join('')}</div>` : empty('No open tasks. Say “remind me to…” on a call to add one.'), { actions: `<a class="link-btn" href="#/tasks">Board →</a>` })}
+      </div>
+
+      <div class="grid-2">
+        ${card('This week', Charts.bars(weekBars, { highlight: todayIdx }), { actions: `<a class="link-btn" href="#/reports" data-report="week">Weekly report →</a>` })}
+        ${card(`${U.MONTHS[new Date().getMonth()]} by area`, donutData.length ? `<div class="donut-wrap">${Charts.donut(donutData, { center: String(month.items.length), sub: 'items' })}${Charts.legend(donutData, { max: 7 })}</div>` : empty('Your area breakdown appears once you log work.'), { actions: `<a class="link-btn" href="#/reports" data-report="month">Monthly report →</a>` })}
+      </div>
+      ${!Store.entries.some((e) => !e.templateId && !e.goalId) ? `<div class="banner">${U.icon('spark')}<div><b>Want to see it in action?</b> Load a year of sample IT-ops data to explore the dashboards — you can remove it with one click later.</div><button class="btn btn-ghost" id="btnDemo">Load sample data</button></div>` : ''}
+    `;
+  }
+
+  /* ---------------- Today's Routine (library tickets due today) ---------------- */
+  const PR_GROUPS = [['critical', 'Critical'], ['high', 'High'], ['normal', 'Medium'], ['low', 'Low']];
+  function viewRoutine() {
+    $('#pageSub').textContent = `${U.fmtDate(new Date())} · your daily, weekly and monthly checks`;
+    const all = Library.todays();
+    const pkgOn = Library.packages().some((p) => p.auto && p.mode !== 'manual') && Store.settings.routinesEnabled !== false;
+    if (!all.length) {
+      return card("Today's routine", empty(pkgOn ? 'No routine checks are due today.' : 'Routines are off. Pick tasks from the library or turn a routine on.',
+        `<div class="btn-row"><button class="btn btn-primary" id="rtAssign">${U.icon('package')} Assign what’s due</button><a class="btn btn-ghost" href="#/library">${U.icon('library')} Open Task Library</a></div>`));
+    }
+    const done = all.filter((e) => e.status === 'done').length;
+    const pct = Math.round((done / all.length) * 100);
+    const label = pct === 100 ? 'Outstanding — everything resolved' : pct >= 75 ? 'Excellent day' : pct >= 50 ? 'Solid progress' : pct >= 25 ? 'Building momentum' : pct > 0 ? 'Warming up' : "No checks resolved yet — let's get started";
+    const openOf = (p) => all.filter((e) => e.status !== 'done' && e.priority === p).length;
+    const locs = [...new Set(all.map((e) => e.location).filter(Boolean))];
+    const st = ui.routineStatus;
+    const shown = all.filter((e) => (!ui.focusLoc || e.location === ui.focusLoc) && (st === 'all' || (st === 'done' ? e.status === 'done' : e.status !== 'done')));
+    const row = (e) => `
+        <div class="focus-row ${e.status === 'done' ? 'is-done' : ''}" style="--cat:${Categories.get(e.category).color}">
+          <button class="tick" data-toggle-done="${e.id}" aria-pressed="${e.status === 'done'}" title="${e.status === 'done' ? 'Mark as open' : 'Mark done'}">${U.icon('check')}</button>
+          <span class="badge mono">${U.esc(e.ticket)}</span>
+          <span class="fr-title" data-edit="${e.id}" title="${U.safe(e.title)}">${U.safe(e.title)}</span>
+          <span class="fr-meta">${chip(e.category)}${locBadge(e.location)}<span class="badge cad-${(e.tags || [])[0] || ''}">${U.esc((e.tags || [])[0] || '')}</span>${e.status === 'in-progress' || e.status === 'blocked' ? stBadge(e.status) : ''}</span>
+        </div>`;
+    const groups = PR_GROUPS.map(([k, l]) => [k, l, shown.filter((e) => e.priority === k).sort((a, b) => a.ticket.localeCompare(b.ticket))]).filter(([, , list]) => list.length);
+    const openShown = shown.filter((e) => e.status !== 'done').length;
+    return `
+      <div class="routine-head card">
+        <div class="rh-progress">
+          <div class="rh-top"><b>${done} of ${all.length} done</b><span class="muted">${label}</span></div>
+          <div class="progress big"><span style="width:${pct}%"></span></div>
+        </div>
+        <div class="rh-stats">
+          ${PR_GROUPS.map(([k, l]) => `<div class="rh-stat pr-${k}"><b>${openOf(k)}</b><span>${l} open</span></div>`).join('')}
+        </div>
+      </div>
+      <div class="toolbar routine-bar">
+        <div class="seg" role="tablist">${[['open', 'Open'], ['done', 'Done'], ['all', 'All']].map(([v, l]) => `<button role="tab" class="${st === v ? 'on' : ''}" data-rt-status="${v}">${l}</button>`).join('')}</div>
+        ${locs.length ? `<div class="chips" role="group" aria-label="Filter by site"><button class="fchip ${!ui.focusLoc ? 'on' : ''}" data-focus-loc="">All sites</button>${locs.map((l) => `<button class="fchip ${ui.focusLoc === l ? 'on' : ''}" data-focus-loc="${U.esc(l)}">${U.esc(l)}</button>`).join('')}</div>` : ''}
+        <span class="spacer"></span>
+        ${openShown ? `<button class="btn btn-ghost sm" id="rtAllDone" data-n="${openShown}">${U.icon('check')} Mark ${openShown} shown as done</button>` : ''}
+        <button class="btn btn-ghost sm" id="rtAssign" title="Assign anything due today that isn't on the list yet">${U.icon('package')} Assign what’s due</button>
+        <a class="btn btn-ghost sm" href="#/library">${U.icon('library')} Library</a>
+      </div>
+      ${groups.length ? groups.map(([k, l, list]) => `
+        <section class="pr-group pr-${k}">
+          <h4><span class="pr-dot"></span>${l} <span class="muted">· ${list.length}</span></h4>
+          <div class="card focus-list single">${list.map(row).join('')}</div>
+        </section>`).join('') : card('', empty(st === 'open' ? 'Every check here is done. Outstanding.' : 'Nothing matches this filter.'))}`;
+  }
+
+  function kpi(label, val, sub, icon) {
+    return `<div class="kpi"><div class="kpi-ico">${U.icon(icon)}</div><div><div class="kpi-label">${label}</div><div class="kpi-val">${val}</div><div class="kpi-sub">${sub}</div></div></div>`;
+  }
+
+  /* ---------------- Log ---------------- */
+  function logItems() {
+    const f = ui.log;
+    let items = Store.entries.slice();
+    if (f.period !== 'all') { const r = Reports.range(f.period); items = Store.inRange(r.start, r.end); }
+    if (f.cat) items = items.filter((e) => e.category === f.cat);
+    if (f.type) items = items.filter((e) => e.type === f.type);
+    if (f.status) items = items.filter((e) => e.status === f.status);
+    if (f.q) { const q = f.q.toLowerCase(); items = items.filter((e) => `${e.title} ${e.details} ${e.ticket} ${(e.tags || []).join(' ')}`.toLowerCase().includes(q)); }
+    return items.sort((a, b) => Reports.entryTime(b) - Reports.entryTime(a));
+  }
+  function viewLog() {
+    $('#pageSub').textContent = 'Everything you have done — searchable';
+    const f = ui.log;
+    const opt = (v, l, cur) => `<option value="${v}" ${v === cur ? 'selected' : ''}>${l}</option>`;
+    return `
+      <div class="toolbar">
+        <label class="search">${U.icon('search')}<input id="logQ" placeholder="Search title, details, ticket, tag…" value="${U.esc(f.q)}" /></label>
+        <select id="logPeriod">${opt('day', 'Today', f.period)}${opt('week', 'This week', f.period)}${opt('month', 'This month', f.period)}${opt('quarter', 'This quarter', f.period)}${opt('year', 'This year', f.period)}${opt('all', 'All time', f.period)}</select>
+        <select id="logCat">${opt('', 'All areas', f.cat)}${Categories.list.map((c) => opt(c.id, c.name, f.cat)).join('')}</select>
+        <select id="logType">${opt('', 'All types', f.type)}${opt('entry', 'Entries', f.type)}${opt('task', 'Tasks', f.type)}${opt('job', 'Jobs', f.type)}</select>
+        <select id="logStatus">${opt('', 'Any status', f.status)}${Object.entries(STATUS).map(([k, v]) => opt(k, v, f.status)).join('')}</select>
+        <button class="btn btn-ghost" id="logCsv">${U.icon('download')} CSV</button>
+      </div>
+      <div id="logList"></div>`;
+  }
+  function renderLogList() {
+    const items = logItems();
+    const host = $('#logList');
+    if (!items.length) { host.innerHTML = empty('No matching entries.'); return; }
+    const groups = new Map();
+    items.slice(0, 1500).forEach((e) => { const k = U.ymd(Reports.entryTime(e)); if (!groups.has(k)) groups.set(k, []); groups.get(k).push(e); });
+    host.innerHTML = `<p class="muted small">${items.length} item${items.length > 1 ? 's' : ''} · ${U.fmtDuration(items.reduce((s, e) => s + (e.minutes || 0), 0))} recorded</p>` +
+      [...groups.entries()].map(([k, list]) => `<section class="day-group"><h4>${U.relDay(U.parseYmd(k))} <span class="muted">· ${list.length}</span></h4><div class="card list-card">${list.map((e) => entryRow(e)).join('')}</div></section>`).join('');
+  }
+
+  /* ---------------- Tasks ---------------- */
+  function viewTasks() {
+    $('#pageSub').textContent = 'Drag cards between columns to update status';
+    const tasks = Store.entries.filter((e) => e.type !== 'entry' && (ui.tasksFilter === 'all' || (ui.tasksFilter === 'routine' ? !!e.templateId : !e.templateId)));
+    const weekAgo = U.addDays(new Date(), -7);
+    const cols = [
+      ['open', 'Open'], ['in-progress', 'In progress'], ['blocked', 'Blocked'], ['done', 'Done (7 days)'],
+    ];
+    return `
+      <form class="quick wide" id="taskForm" autocomplete="off">
+        <div class="quick-input"><input id="taskText" placeholder="Add a task or job, e.g. “Renew SSL cert on VPN gateway by Thursday, high priority”" /><button type="button" class="icon-btn mic-btn" id="taskMic">${U.icon('mic')}</button></div>
+        <button class="btn btn-primary" type="submit">${U.icon('plus')} Add task</button>
+        <select id="tasksFilter" aria-label="Show">${[['all', 'All tasks'], ['adhoc', 'My tasks only'], ['routine', 'Library & routine checks']].map(([v, l]) => `<option value="${v}" ${ui.tasksFilter === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
+      </form>
+      <div class="board">${cols.map(([st, label]) => {
+        let list = tasks.filter((t) => t.status === st);
+        if (st === 'done') list = list.filter((t) => new Date(t.completedAt || t.updated) >= weekAgo);
+        list.sort((a, b) => (a.due || '9999').localeCompare(b.due || '9999'));
+        return `<div class="col" data-status="${st}"><div class="col-head"><span class="badge st-${st}">${label}</span><span class="muted">${list.length}</span></div>
+          <div class="col-body">${list.map(taskCard).join('') || '<div class="col-empty">Drop here</div>'}</div></div>`;
+      }).join('')}</div>`;
+  }
+
+  /* ---------------- Reports ---------------- */
+  function viewReports() {
+    const { kind, anchor } = ui.report;
+    const r = Reports.range(kind, anchor);
+    const a = Reports.aggregate(r);
+    $('#pageSub').textContent = r.label;
+    const donutData = a.cats.map((c) => ({ label: c.cat.name, value: c.n, color: c.cat.color }));
+    const timeData = a.cats.filter((c) => c.minutes).sort((x, y) => y.minutes - x.minutes).map((c) => ({ label: c.cat.name, value: Math.round(c.minutes / 6) / 10, color: c.cat.color, sub: 'hours' }));
+    const statusCounts = Object.keys(STATUS).map((k) => ({ k, n: a.items.filter((e) => e.status === k).length }));
+    const highlights = a.items.filter((e) => e.priority === 'critical' || e.priority === 'high').slice(-8).reverse();
+    const heat = {};
+    a.items.forEach((e) => { const k = U.ymd(Reports.entryTime(e)); heat[k] = (heat[k] || 0) + 1; });
+    const hmEnd = new Date(Math.min(U.addDays(r.end, -1).getTime(), Date.now()));
+    const isCurrent = r.start <= new Date() && new Date() < r.end;
+
+    return `
+      <div class="report-bar no-print">
+        <div class="seg" role="tablist">${Reports.KINDS.map((k) => `<button role="tab" class="${k === kind ? 'on' : ''}" data-kind="${k}">${U.capitalize(k)}</button>`).join('')}</div>
+        <div class="pager">
+          <button class="icon-btn" data-shift="-1" title="Previous">${U.icon('chevL')}</button>
+          <button class="btn btn-ghost sm" data-shift="0" ${isCurrent ? 'disabled' : ''}>Current</button>
+          <button class="icon-btn" data-shift="1" title="Next">${U.icon('chevR')}</button>
+        </div>
+        <div class="report-actions">
+          <button class="btn btn-ghost sm" id="repCopy">Copy summary</button>
+          <button class="btn btn-ghost sm" id="repMd">${U.icon('download')} Markdown</button>
+          <button class="btn btn-ghost sm" id="repCsv">${U.icon('download')} CSV</button>
+          <button class="btn btn-primary sm" id="repPrint">${U.icon('printer')} Print / PDF</button>
+        </div>
+      </div>
+
+      <div class="report">
+        <header class="report-head">
+          <div><p class="eyebrow">${U.capitalize(kind)} report</p><h2>${U.esc(r.label)}</h2>
+          ${Store.settings.name ? `<p class="muted">${U.esc(Store.settings.name)} · ${U.esc(Store.settings.role)}${Store.settings.org ? ' · ' + U.esc(Store.settings.org) : ''}</p>` : ''}</div>
+        </header>
+        <div class="narrative">${U.icon('spark')}<p>${U.esc(Reports.narrative(a))}</p></div>
+
+        <div class="kpis">
+          ${kpi('Items logged', a.items.length, `${a.activeDays} active day${a.activeDays === 1 ? '' : 's'}`, 'log')}
+          ${kpi('Completed', a.done, a.items.length ? Math.round((a.done / a.items.length) * 100) + '% of items' : '—', 'check')}
+          ${kpi('Time recorded', U.fmtDuration(a.minutes), a.activeDays ? U.fmtDuration(a.minutes / a.activeDays) + ' / day' : '—', 'clock')}
+          ${kpi('High / critical', a.critical, 'priority items', 'flame')}
+          ${kpi('Areas covered', a.cats.length, a.cats[0] ? 'Top: ' + a.cats[0].cat.name : '—', 'dashboard')}
+          ${kpi('Tickets referenced', a.tickets, `${a.createdTasks} tasks raised`, 'tasks')}
+        </div>
+
+        <div class="grid-2">
+          ${card('Activity', a.items.length ? Charts.bars(a.buckets, { highlight: kind === 'week' || kind === 'month' ? a.buckets.findIndex((b) => U.sameDay(b.start, new Date())) : -1 }) : empty('No activity in this period.'))}
+          ${card('By area', donutData.length ? `<div class="donut-wrap">${Charts.donut(donutData, { center: String(a.items.length), sub: 'items' })}${Charts.legend(donutData, { max: 10 })}</div>` : empty('No data.'))}
+        </div>
+        <div class="grid-2">
+          ${card('Time by area', timeData.length ? Charts.hbars(timeData) : empty('Add “time spent” to entries to see where your hours go.'))}
+          ${card('Status & highlights', `<div class="status-row">${statusCounts.map((s) => `<div class="status-pill st-${s.k}"><b>${s.n}</b><span>${STATUS[s.k]}</span></div>`).join('')}</div>
+            ${highlights.length ? `<h4 class="sub-h">High-impact work</h4><div class="mini-list">${highlights.map((e) => `<div>${prBadge(e.priority)} ${U.safe(e.title)} <span class="muted small">· ${U.fmtDate(Reports.entryTime(e))}</span></div>`).join('')}</div>` : ''}`)}
+        </div>
+        ${kind === 'quarter' || kind === 'year' ? card('Daily activity', Charts.heatmap(heat, { weeks: kind === 'year' ? 53 : 14, end: hmEnd }), { cls: 'heat-card' }) : ''}
+        ${(() => {
+          const cap = { day: 500, week: 500, month: 120, quarter: 40, year: 40 }[kind];
+          const list = kind === 'quarter' || kind === 'year' ? a.items.filter((e) => e.priority === 'critical' || e.priority === 'high') : a.items;
+          const shown = list.slice().reverse().slice(0, cap);
+          const title = kind === 'quarter' || kind === 'year' ? 'Notable work (high / critical)' : 'Detailed log';
+          const more = list.length > shown.length ? `<p class="muted small">Showing ${shown.length} of ${list.length}. Full list: <a href="#/log">Work Log</a> or export CSV.</p>` : '';
+          return card(`${title} <span class="muted small">(${list.length})</span>`, shown.length ? `<div class="timeline">${shown.map((e) => entryRow(e, { showDate: kind !== 'day' })).join('')}</div>${more}` : empty('Nothing logged in this period.'), { cls: 'log-card' });
+        })()}
+      </div>`;
+  }
+
+  /* ---------------- Settings ---------------- */
+  function viewSettings() {
+    $('#pageSub').textContent = 'Profile, assistant, schedule and data';
+    const s = Store.settings;
+    const voices = Voice.voices().filter((v) => v.lang.startsWith('en'));
+    const sched = s.schedule.map((w, i) => `
+      <div class="sched-row" data-i="${i}">
+        <div class="days">${U.DAYS_SHORT.map((d, di) => `<button type="button" class="day ${w.days.includes(di) ? 'on' : ''}" data-day="${di}">${d}</button>`).join('')}</div>
+        <label>From <input type="time" data-k="start" value="${w.start}" /></label>
+        <label>To <input type="time" data-k="end" value="${w.end}" /></label>
+        <button type="button" class="icon-btn sm" data-rm="${i}" title="Remove">${U.icon('trash')}</button>
+      </div>`).join('');
+    const weekSlots = [0, 1, 2, 3, 4, 5, 6].map((d) => { const dt = U.addDays(U.startOfDay(new Date()), (d - new Date().getDay() + 7) % 7); return { d, n: Agent.slotsFor(dt).length, first: Agent.slotsFor(dt)[0], last: Agent.slotsFor(dt).slice(-1)[0] }; });
+    const notif = 'Notification' in window ? Notification.permission : 'unsupported';
+
+    return `
+      <div class="settings">
+        ${card('Profile', `
+          <div class="grid-3">
+            <label class="field"><span>Your name</span><input data-set="name" value="${U.esc(s.name)}" placeholder="e.g. Alex" /></label>
+            <label class="field"><span>Role</span><input data-set="role" value="${U.esc(s.role)}" /></label>
+            <label class="field"><span>Organisation / team</span><input data-set="org" value="${U.esc(s.org)}" /></label>
+            <label class="field"><span>Your sites / campuses <small class="muted">— comma separated</small></span><input data-set="locations" data-list value="${U.esc((s.locations || []).join(', '))}" placeholder="e.g. HQ, Branch, Data centre" /></label>
+            <label class="field"><span>Week starts on</span><select data-set="weekStart" data-num>${[0, 1, 6].map((d) => `<option value="${d}" ${s.weekStart === d ? 'selected' : ''}>${U.DAYS[d]}</option>`).join('')}</select></label>
+            <label class="field"><span>Theme</span><select data-set="theme">${['system', 'dark', 'light'].map((t) => `<option ${s.theme === t ? 'selected' : ''}>${t}</option>`).join('')}</select></label>
+            <label class="field check"><input type="checkbox" data-set="showcase" ${s.showcase ? 'checked' : ''}/><span>Showcase mode — mask e-mails and IP addresses on screen and in exports</span></label>
+          </div>`)}
+
+        ${card('Check-in assistant', `
+          <div class="grid-3">
+            <label class="field check"><input type="checkbox" data-set="agentEnabled" ${s.agentEnabled ? 'checked' : ''}/><span>Call me for check-ins</span></label>
+            <label class="field"><span>Assistant name</span><input data-set="agentName" value="${U.esc(s.agentName)}" /></label>
+            <label class="field"><span>Call every</span><select data-set="interval" data-num>${[15, 20, 30, 45, 60, 90, 120].map((m) => `<option value="${m}" ${Number(s.interval) === m ? 'selected' : ''}>${m} minutes</option>`).join('')}</select></label>
+            <label class="field check"><input type="checkbox" data-set="ringtone" ${s.ringtone ? 'checked' : ''}/><span>Ringtone</span></label>
+            <label class="field check"><input type="checkbox" data-set="reRingMissed" ${s.reRingMissed ? 'checked' : ''}/><span>Call back once after 5 min if missed</span></label>
+            <label class="field check"><input type="checkbox" data-set="autoListen" ${s.autoListen ? 'checked' : ''}/><span>Listen automatically after the assistant speaks</span></label>
+            <label class="field"><span>Ring for</span><select data-set="ringSeconds" data-num>${[20, 30, 45, 60, 90].map((m) => `<option value="${m}" ${Number(s.ringSeconds) === m ? 'selected' : ''}>${m} seconds</option>`).join('')}</select></label>
+            <label class="field"><span>Assistant voice</span><select data-set="voice"><option value="">Auto (best available)</option>${voices.map((v) => `<option ${s.voice === v.name ? 'selected' : ''}>${U.esc(v.name)}</option>`).join('')}</select></label>
+            <label class="field"><span>Speech language</span><select data-set="lang">${['en-US', 'en-GB', 'en-IN', 'en-AU', 'en-IE'].map((l) => `<option ${s.lang === l ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+          </div>
+          <div class="btn-row">
+            <button class="btn btn-primary" id="testCall">${U.icon('phone')} Test incoming call</button>
+            <button class="btn btn-ghost" id="testVoice">Test voice</button>
+            <button class="btn btn-ghost" id="askNotif" ${notif === 'granted' || notif === 'unsupported' ? 'disabled' : ''}>${U.icon('bell')} ${notif === 'granted' ? 'Notifications enabled' : notif === 'unsupported' ? 'Notifications unsupported' : 'Enable desktop notifications'}</button>
+          </div>
+          <p class="muted small">Voice input: ${Voice.supported.stt ? '✅ supported in this browser' : '⚠️ not supported here — use Chrome or Edge, or type during calls'} · Voice output: ${Voice.supported.tts ? '✅' : '⚠️ not supported'}</p>`)}
+
+        ${card('Working hours (check-in schedule)', `
+          <div id="sched">${sched}</div>
+          <div class="btn-row"><button class="btn btn-ghost" id="addWin">${U.icon('plus')} Add time window</button><button class="btn btn-ghost" id="resetWin">Reset to default</button></div>
+          <div class="week-preview">${weekSlots.map((w) => `<div class="wp ${w.n ? 'on' : ''}"><b>${U.DAYS_SHORT[w.d]}</b><span>${w.n ? `${w.n} calls` : 'off'}</span><small>${w.n ? U.fmt12(U.fromMin(w.first)) + '–' + U.fmt12(U.fromMin(w.last)) : ''}</small></div>`).join('')}</div>
+          <p class="muted small">Calls ring at each interval from the start to the end of each window (inclusive). The last call of the day is the <b>end-of-day wrap-up</b>; on the last working day of a week, month, quarter or year the matching report opens automatically.</p>`)}
+
+        ${card('Ring me even when the browser is closed (Windows)', `
+          <p>Browsers can only ring while OpsLog is open (or installed as an app). To get a guaranteed call on your Windows PC, run the PowerShell helper once — it creates scheduled tasks that <b>speak an alert</b> and open OpsLog in "incoming call" mode at every check-in slot.</p>
+          <pre class="code">.\\tools\\Register-OpsLogCheckins.ps1 -AppUrl "${U.esc(location.origin + location.pathname)}"</pre>
+          <a class="btn btn-ghost" href="tools/Register-OpsLogCheckins.ps1" download>${U.icon('download')} Download script</a>`)}
+
+        ${card('Data & backup', `
+          <p class="muted">Your data is stored only in this browser (${Store.entries.length} items, ${Store.calls.length} call records). Export a backup regularly or before clearing browser data.</p>
+          <div class="btn-row">
+            <button class="btn btn-primary" id="expJson">${U.icon('download')} Export backup (JSON)</button>
+            <label class="btn btn-ghost">${U.icon('upload')} Import backup<input type="file" id="impJson" accept="application/json,.json" hidden /></label>
+            <button class="btn btn-ghost" id="expCsvAll">${U.icon('download')} Export all (CSV)</button>
+          </div>
+          <div class="btn-row">
+            <button class="btn btn-ghost" id="demoLoad">Load sample data</button>
+            <button class="btn btn-ghost" id="demoRemove">Remove sample data</button>
+            <button class="btn btn-danger-ghost" id="wipe">Delete everything</button>
+          </div>`)}
+      </div>`;
+  }
+
+  /* ---------------- after-render wiring ---------------- */
+  const afterRender = {
+    routine() {
+      $$('[data-rt-status]').forEach((b) => b.addEventListener('click', () => { ui.routineStatus = b.dataset.rtStatus; render(); }));
+      $('#rtAssign').addEventListener('click', () => {
+        const before = Library.todays().length;
+        Library.packages().filter((p) => p.auto && p.mode !== 'manual').forEach((p) => Library.runPackage(p));
+        const n = Library.todays().length - before;
+        U.toast(n ? `Assigned ${n} more check${n > 1 ? 's' : ''}` : 'Everything due today is already on the list', n ? 'success' : 'info');
+        render();
+      });
+      const all = $('#rtAllDone');
+      if (all) all.addEventListener('click', () => {
+        if (!all.dataset.armed) { all.dataset.armed = '1'; all.classList.add('btn-confirm'); all.innerHTML = `${U.icon('check')} Confirm: mark ${all.dataset.n} done`; setTimeout(() => { if (all.isConnected) render(); }, 4000); return; }
+        const st = ui.routineStatus;
+        Library.todays().filter((e) => e.status !== 'done' && (!ui.focusLoc || e.location === ui.focusLoc) && st !== 'done').forEach((e) => Store.update(e.id, { status: 'done' }));
+        U.toast('Marked as done', 'success');
+      });
+    },
+    dashboard() {
+      const hb = $('#bannerHide');
+      if (hb) hb.addEventListener('click', () => { try { localStorage.setItem('opslog:banner:hidden', U.ymd(new Date())); } catch { /* ignore */ } render(); });
+      const df = $('#dashFocus');
+      if (df) df.addEventListener('click', () => WL.Focus.open());
+      const input = $('#quickText');
+      const preview = U.debounce(() => {
+        const list = Parser.parse(input.value);
+        $('#quickPreview').innerHTML = list.map((p) => `<span class="pv">${chip(p.category)} <span>${U.safe(p.title)}</span>${p.type !== 'entry' ? ` <span class="badge">${p.type}</span>` : ''}${p.minutes ? ` <span class="meta">${U.fmtDuration(p.minutes)}</span>` : ''}</span>`).join('');
+      }, 150);
+      input.addEventListener('input', preview);
+      $('#quickForm').addEventListener('submit', (ev) => {
+        ev.preventDefault();
+        const list = Parser.parse(input.value);
+        if (!list.length) return;
+        Store.addMany(list);
+        U.toast(`Logged ${list.length} item${list.length > 1 ? 's' : ''}`, 'success');
+        input.value = '';
+      });
+      $('#quickMic').addEventListener('click', () => dictateInto(input, $('#quickMic'), preview));
+      const demo = $('#btnDemo');
+      if (demo) demo.addEventListener('click', () => { const n = WL.Demo.load(); U.toast(`Loaded ${n} sample items`, 'success'); });
+    },
+    log() {
+      const f = ui.log;
+      renderLogList();
+      $('#logQ').addEventListener('input', U.debounce((e) => { f.q = e.target.value; renderLogList(); }, 150));
+      [['#logPeriod', 'period'], ['#logCat', 'cat'], ['#logType', 'type'], ['#logStatus', 'status']].forEach(([sel, k]) => $(sel).addEventListener('change', (e) => { f[k] = e.target.value; renderLogList(); }));
+      $('#logCsv').addEventListener('click', () => U.download(`opslog-${U.ymd(new Date())}.csv`, Reports.toCSV(logItems()), 'text/csv'));
+    },
+    tasks() {
+      const input = $('#taskText');
+      $('#taskForm').addEventListener('submit', (ev) => {
+        ev.preventDefault();
+        if (!input.value.trim()) return;
+        const p = Parser.parseOne(input.value);
+        if (p.type === 'entry') p.type = 'task';
+        if (p.status === 'done') p.status = 'open';
+        if (!p.due) p.due = Parser.parseOne(input.value + ' need to').due;
+        Store.add(p);
+        input.value = '';
+        U.toast('Task added', 'success');
+      });
+      $('#taskMic').addEventListener('click', () => dictateInto(input, $('#taskMic')));
+      $('#tasksFilter').addEventListener('change', (e) => { ui.tasksFilter = e.target.value; render(); });
+      // drag & drop
+      let dragId = null;
+      $$('.task-card').forEach((c) => {
+        c.addEventListener('dragstart', (e) => { dragId = c.dataset.id; c.classList.add('dragging'); e.dataTransfer.effectAllowed = 'move'; });
+        c.addEventListener('dragend', () => c.classList.remove('dragging'));
+      });
+      $$('.col').forEach((col) => {
+        col.addEventListener('dragover', (e) => { e.preventDefault(); col.classList.add('over'); });
+        col.addEventListener('dragleave', () => col.classList.remove('over'));
+        col.addEventListener('drop', (e) => { e.preventDefault(); col.classList.remove('over'); if (dragId) Store.update(dragId, { status: col.dataset.status }); dragId = null; });
+      });
+    },
+    reports() {
+      const v = $('#view');
+      v.querySelectorAll('[data-kind]').forEach((b) => b.addEventListener('click', () => { ui.report.kind = b.dataset.kind; render(); }));
+      v.querySelectorAll('[data-shift]').forEach((b) => b.addEventListener('click', () => {
+        const d = Number(b.dataset.shift);
+        ui.report.anchor = d === 0 ? new Date() : Reports.shift(ui.report.kind, ui.report.anchor, d);
+        render();
+      }));
+      const a = () => Reports.aggregate(Reports.range(ui.report.kind, ui.report.anchor));
+      const fname = () => `opslog-${ui.report.kind}-${U.ymd(Reports.range(ui.report.kind, ui.report.anchor).start)}`;
+      $('#repCopy').addEventListener('click', () => {
+        const x = a();
+        const text = `${x.r.label}\n${Reports.narrative(x)}\n\n` + x.cats.map((c) => `• ${c.cat.name}: ${c.n}`).join('\n');
+        navigator.clipboard.writeText(text).then(() => U.toast('Summary copied', 'success'), () => U.toast('Copy failed', 'error'));
+      });
+      $('#repMd').addEventListener('click', () => U.download(fname() + '.md', Reports.toMarkdown(a()), 'text/markdown'));
+      $('#repCsv').addEventListener('click', () => U.download(fname() + '.csv', Reports.toCSV(a().items), 'text/csv'));
+      $('#repPrint').addEventListener('click', () => window.print());
+    },
+    settings() {
+      const v = $('#view');
+      v.querySelectorAll('[data-set]').forEach((inp) => {
+        inp.addEventListener('change', () => {
+          const k = inp.dataset.set;
+          let val = inp.type === 'checkbox' ? inp.checked : inp.value;
+          if (inp.hasAttribute('data-num')) val = Number(val);
+          if (inp.hasAttribute('data-list')) val = String(val).split(',').map((x) => x.trim()).filter(Boolean);
+          Store.saveSettings({ [k]: val });
+          if (k === 'theme') applyTheme();
+          if (k === 'showcase') paintToggles();
+          if (['interval', 'agentEnabled', 'weekStart'].includes(k)) render();
+          U.toast('Saved', 'success', 1200);
+        });
+      });
+      const saveSched = (rerender = true) => {
+        const rows = $$('.sched-row', v).map((row) => ({
+          days: $$('.day.on', row).map((b) => Number(b.dataset.day)),
+          start: $('[data-k=start]', row).value, end: $('[data-k=end]', row).value,
+        })).filter((w) => w.start && w.end);
+        Store.saveSettings({ schedule: rows });
+        if (rerender) render();
+      };
+      $('#sched').addEventListener('click', (e) => {
+        const d = e.target.closest('.day');
+        if (d) { d.classList.toggle('on'); saveSched(); }
+        const rm = e.target.closest('[data-rm]');
+        if (rm) { rm.closest('.sched-row').remove(); saveSched(); }
+      });
+      $('#sched').addEventListener('change', () => saveSched());
+      $('#addWin').addEventListener('click', () => { Store.saveSettings({ schedule: [...Store.settings.schedule, { days: [0, 1, 2, 3], start: '09:00', end: '10:00' }] }); render(); });
+      $('#resetWin').addEventListener('click', () => { Store.saveSettings({ schedule: JSON.parse(JSON.stringify(Store.DEFAULT_SETTINGS.schedule)), interval: 30 }); render(); });
+      $('#testCall').addEventListener('click', () => { U.toast('Ringing in 3 seconds — switch tabs to test the notification.', 'info'); setTimeout(() => Agent.test(), 3000); });
+      $('#testVoice').addEventListener('click', () => Voice.speak(`Hi${Store.settings.name ? ' ' + Store.settings.name.split(' ')[0] : ''}, this is ${Store.settings.agentName}. I'll check in with you every ${Store.settings.interval} minutes during your shift.`));
+      $('#askNotif').addEventListener('click', () => Notification.requestPermission().then(() => render()));
+      $('#expJson').addEventListener('click', () => U.download(`opslog-backup-${U.ymd(new Date())}.json`, Store.exportJSON(), 'application/json'));
+      $('#expCsvAll').addEventListener('click', () => U.download(`opslog-all-${U.ymd(new Date())}.csv`, Reports.toCSV(Store.entries.slice().sort((a, b) => new Date(a.when) - new Date(b.when))), 'text/csv'));
+      $('#impJson').addEventListener('change', async (e) => {
+        const file = e.target.files[0]; if (!file) return;
+        try {
+          const replace = confirm('Replace all current data with this backup?\n\nOK = replace, Cancel = merge (keep existing and add new items).');
+          const n = Store.importJSON(await file.text(), replace ? 'replace' : 'merge');
+          U.toast(`Imported ${n} items`, 'success');
+        } catch (err) { U.toast('Import failed: ' + err.message, 'error'); }
+      });
+      $('#demoLoad').addEventListener('click', () => { const n = WL.Demo.load(); U.toast(`Loaded ${n} sample items`, 'success'); });
+      $('#demoRemove').addEventListener('click', () => { WL.Demo.remove(); U.toast('Sample data removed', 'success'); });
+      $('#wipe').addEventListener('click', () => {
+        if (prompt('This permanently deletes all entries and call history in this browser. Type DELETE to confirm.') === 'DELETE') { Store.clearAll(); U.toast('All data deleted', 'success'); }
+      });
+    },
+  };
+
+  /* ---------------- dictation helper (outside calls) ---------------- */
+  function dictateInto(input, btn, onDone) {
+    if (!Voice.supported.stt) { U.toast('Voice input needs Chrome, Edge or Safari.', 'warn'); return; }
+    if (Voice.isListening()) { Voice.stopListening(); return; }
+    const base = input.value ? input.value.trim() + ' ' : '';
+    btn.classList.add('rec');
+    Voice.listen({ onInterim: (t) => { input.value = base + t; } })
+      .then((t) => { input.value = (base + t).trim(); input.dispatchEvent(new Event('input')); onDone && onDone(); })
+      .catch((e) => U.toast(e.message, 'error'))
+      .finally(() => btn.classList.remove('rec'));
+  }
+
+  /* ---------------- editor ---------------- */
+  let editing = null;
+  let touched = new Set();
+  function toLocalInput(d) { return `${U.ymd(d)}T${U.hm(d)}`; }
+  function openEditor(id = null, { dictate = false } = {}) {
+    const dlg = $('#editor');
+    editing = id ? Store.get(id) : null;
+    touched = new Set(editing ? ['fTitle', 'fCategory', 'fType', 'fStatus', 'fPriority', 'fMinutes', 'fTicket', 'fLocation'] : []);
+    $('#fCategory').innerHTML = Categories.list.map((c) => `<option value="${c.id}">${c.name}</option>`).join('');
+    const e = editing || { title: '', details: '', category: 'other', type: 'entry', status: 'done', priority: 'normal', minutes: '', ticket: '', when: new Date().toISOString(), due: '', tags: [] };
+    $('#editorTitle').textContent = editing ? 'Edit item' : 'New entry';
+    $('#fDetails').value = e.details || '';
+    $('#fTitle').value = e.title;
+    $('#fCategory').value = e.category;
+    $('#fType').value = e.type;
+    $('#fStatus').value = e.status;
+    $('#fPriority').value = e.priority;
+    $('#fMinutes').value = e.minutes || '';
+    $('#fTicket').value = e.ticket || '';
+    $('#fLocation').innerHTML = ['', ...Library.LOCATIONS].map((l) => `<option value="${l}">${l || '—'}</option>`).join('');
+    $('#fLocation').value = e.location || '';
+    $('#fWhen').value = toLocalInput(new Date(e.when));
+    $('#fDue').value = e.due || '';
+    $('#fTags').value = (e.tags || []).join(', ');
+    $('#fDelete').style.visibility = editing ? 'visible' : 'hidden';
+    if (!dlg.open) dlg.showModal();
+    setTimeout(() => (editing ? $('#fTitle') : $('#fDetails')).focus(), 30);
+    if (dictate) setTimeout(() => $('#fMic').click(), 200);
+  }
+  function wireEditor() {
+    const dlg = $('#editor');
+    ['fTitle', 'fCategory', 'fType', 'fStatus', 'fPriority', 'fMinutes', 'fTicket', 'fLocation'].forEach((id) => $('#' + id).addEventListener('input', () => touched.add(id)));
+    const autofill = () => {
+      const p = Parser.parseOne($('#fDetails').value, {});
+      if (!$('#fDetails').value.trim()) return;
+      const set = (id, v) => { if (!touched.has(id) && v != null && v !== '') $('#' + id).value = v; };
+      set('fTitle', p.title); set('fCategory', p.category); set('fType', p.type); set('fStatus', p.status); set('fPriority', p.priority); set('fMinutes', p.minutes); set('fTicket', p.ticket); set('fLocation', p.location);
+      if (p.due && !$('#fDue').value) $('#fDue').value = p.due;
+    };
+    $('#fDetails').addEventListener('input', U.debounce(autofill, 120));
+    $('#fMic').addEventListener('click', () => dictateInto($('#fDetails'), $('#fMic'), autofill));
+    $('#editorForm').addEventListener('submit', (ev) => {
+      ev.preventDefault();
+      const data = {
+        title: $('#fTitle').value.trim() || 'Untitled', details: $('#fDetails').value.trim(), category: $('#fCategory').value,
+        type: $('#fType').value, status: $('#fStatus').value, priority: $('#fPriority').value,
+        minutes: Number($('#fMinutes').value) || null, ticket: $('#fTicket').value.trim(), location: $('#fLocation').value,
+        when: new Date($('#fWhen').value || Date.now()).toISOString(), due: $('#fDue').value || null,
+        tags: $('#fTags').value.split(',').map((t) => t.trim()).filter(Boolean),
+      };
+      if (editing) Store.update(editing.id, data); else Store.add(data);
+      U.toast(editing ? 'Updated' : 'Saved', 'success');
+      Voice.stopListening();
+      dlg.close();
+    });
+    $('#fDelete').addEventListener('click', () => {
+      if (editing && confirm('Delete this item?')) { Store.remove(editing.id); dlg.close(); U.toast('Deleted', 'success'); }
+    });
+    $$('dialog').forEach((d) => {
+      d.addEventListener('click', (e) => { if (e.target === d || e.target.closest('[data-close]')) { Voice.stopListening(); d.close(); } });
+    });
+  }
+
+  /* ---------------- wrap-up modal ---------------- */
+  function showWrapUp() {
+    const now = new Date();
+    const kinds = ['year', 'quarter', 'month', 'week'].filter((k) => Reports.isLastWorkdayOf(k, now));
+    const a = Reports.aggregate(Reports.range('day'));
+    $('#wrapTitle').textContent = `End of day — ${U.fmtDate(now)}`;
+    const tomorrow = Store.openTasks().slice(0, 5);
+    $('#wrapBody').innerHTML = `
+      <div class="narrative">${U.icon('spark')}<p>${U.esc(Reports.narrative(a))}</p></div>
+      <div class="kpis small">${kpi('Items', a.items.length, `${a.done} done`, 'log')}${kpi('Time', U.fmtDuration(a.minutes), 'recorded', 'clock')}${kpi('Areas', a.cats.length, a.cats[0] ? a.cats[0].cat.name : '—', 'dashboard')}</div>
+      ${a.cats.length ? Charts.hbars(a.cats.map((c) => ({ label: c.cat.name, value: c.n, color: c.cat.color }))) : ''}
+      ${tomorrow.length ? `<h4 class="sub-h">Carry over</h4><div class="mini-list">${tomorrow.map((t) => `<div>${chip(t.category)} ${U.safe(t.title)}</div>`).join('')}</div>` : ''}
+      <div class="btn-row">
+        <button class="btn btn-primary" data-open-report="day">Open daily report</button>
+        ${kinds.map((k) => `<button class="btn btn-ghost" data-open-report="${k}">${U.capitalize(k)} report is ready →</button>`).join('')}
+      </div>`;
+    $('#wrapBody').querySelectorAll('[data-open-report]').forEach((b) => b.addEventListener('click', () => {
+      ui.report = { kind: b.dataset.openReport, anchor: new Date() };
+      $('#wrapup').close();
+      location.hash = '#/reports';
+      if (ui.route === 'reports') render();
+    }));
+    $('#wrapup').showModal();
+  }
+
+  /* ---------------- global wiring ---------------- */
+  function applyTheme() {
+    const t = Store.settings.theme;
+    if (t === 'system') delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = t;
+    paintToggles();
+  }
+
+  function wireGlobal() {
+    window.addEventListener('hashchange', route);
+    document.addEventListener('click', (e) => {
+      const call = e.target.closest('[data-call]');
+      if (call) { e.preventDefault(); Agent.startManual(); return; }
+      const ed = e.target.closest('[data-edit]');
+      if (ed && !e.target.closest('#callConvo')) { openEditor(ed.dataset.edit); return; }
+      const tg = e.target.closest('[data-toggle-done]');
+      if (tg) { const x = Store.get(tg.dataset.toggleDone); if (x) Store.update(x.id, { status: x.status === 'done' ? 'open' : 'done' }); return; }
+      const fl = e.target.closest('[data-focus-loc]');
+      if (fl) { ui.focusLoc = fl.dataset.focusLoc; render(); return; }
+      const dn = e.target.closest('[data-done]');
+      if (dn) { Store.update(dn.dataset.done, { status: 'done' }); U.toast('Nice — marked done ✔', 'success'); return; }
+      const rep = e.target.closest('[data-report]');
+      if (rep) { ui.report = { kind: rep.dataset.report, anchor: new Date() }; }
+    });
+    $('#btnNew').addEventListener('click', () => openEditor());
+    $('#btnQuickVoice').addEventListener('click', () => openEditor(null, { dictate: true }));
+    $('#fabCall').addEventListener('click', () => Agent.startManual());
+    $('#btnAskAva').addEventListener('click', () => Agent.startChat());
+    $('#nextCallLink').addEventListener('click', () => (WL.Focus && WL.Focus.isActive() ? WL.Focus.open() : Agent.startManual()));
+    $('#btnTheme').addEventListener('click', () => {
+      const dark = document.documentElement.dataset.theme ? document.documentElement.dataset.theme === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+      Store.saveSettings({ theme: dark ? 'light' : 'dark' });
+      applyTheme();
+    });
+    $('#btnShowcase').addEventListener('click', () => {
+      Store.saveSettings({ showcase: !Store.settings.showcase });
+      paintToggles();
+      U.toast(Store.settings.showcase ? 'Showcase mode on — e-mails & IPs masked' : 'Showcase mode off', 'info');
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.target.matches('input, textarea, select') || document.querySelector('dialog[open]') || document.body.classList.contains('in-call')) return;
+      if (e.key === 'n') { e.preventDefault(); openEditor(); }
+      if (e.key === 'c') { e.preventDefault(); Agent.startManual(); }
+    });
+    Store.on((what) => { if (what === 'entries' || what === 'settings' || what === 'calls') refresh(); });
+    setInterval(() => { renderSideNext(); runRoutines(); }, 30000);
+  }
+
+  // Re-render the current view without losing focus in an input on that view.
+  const refresh = U.debounce(() => {
+    const active = document.activeElement;
+    if (active && $('#view').contains(active) && active.matches('input, textarea, select') && ui.route !== 'tasks') {
+      if (ui.route === 'log') renderLogList();
+      renderSideNext();
+      return;
+    }
+    render();
+  }, 60);
+
+  function registerSW() {
+    if ('serviceWorker' in navigator && location.protocol !== 'file:') {
+      navigator.serviceWorker.register('sw.js').catch((e) => console.warn('SW registration failed', e));
+    }
+  }
+
+  // Assign today's routine checks once per day (and again if the app stays open past midnight).
+  let routineDay = '';
+  function runRoutines() {
+    const today = U.ymd(new Date());
+    if (routineDay === today) return;
+    routineDay = today;
+    const created = Library.autoRun();
+    if (created.length) U.toast(`Assigned ${created.length} routine check${created.length > 1 ? 's' : ''} for today`, 'success', 4500);
+  }
+
+  function init() {
+    renderShell();
+    applyTheme();
+    wireEditor();
+    wireGlobal();
+    Agent.init();
+    runRoutines();
+    route();
+    registerSW();
+    if (!Store.settings.name) setTimeout(() => U.toast('Tip: add your name in Settings so your assistant can greet you.', 'info', 5000), 1500);
+  }
+
+  WL.App = { init, refresh, openEditor, showWrapUp, render, go: (r) => { location.hash = '#/' + r; } };
+  WL.AppUI = { chip, prBadge, stBadge, locBadge, card, empty, kpi, entryRow, taskCard, STATUS, PR_ORDER };
+  document.addEventListener('DOMContentLoaded', init);
+})(window.WL);
